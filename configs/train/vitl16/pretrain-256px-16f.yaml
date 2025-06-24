@@ -64,7 +64,7 @@ meta:
   eval_freq: 100
   load_checkpoint: true
   read_checkpoint: null
-  save_every_freq: 50
+  save_every_freq: 10
   seed: 239
   use_sdpa: true
 model:
@@ -81,7 +81,7 @@ optimization:
   ema:
   - 0.99925
   - 0.99925
-  epochs: 10
+  epochs: 300
   final_lr: 0.000525
   final_weight_decay: 0.04
   ipe: 300
