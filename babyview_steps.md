@@ -30,11 +30,13 @@ conda activate vjepa2-312
 pip install .  # or `pip install -e .` for development mode
 
 # === Data ===
-# 1. rsync the mp4 videos into EFS
-# 2. rsync the data csv into ./data/babyview_paths.csv
-# 3. create a symlink
+# 1. rsync the mp4 videos into scratch space
+rsync -rv -e "ssh -i /ccn2/u/khaiaw/Setup/aws/ondemand.pem" ______data_dir__________ root@________ip________.us-west-2.compute.amazonaws.com:/datasets/babyview_videos
+# 2. create a symlink
 mkdir ./data/videos
-ln -s ________ ./data/videos/babyview_videos
+ln -s /datasets/babyview_videos ./data/videos/babyview_videos
+# 3. create the dataset CSV
+python data/create_train_paths_csv.py
 
 
 
