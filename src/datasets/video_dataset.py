@@ -206,10 +206,14 @@ class VideoDataset(torch.utils.data.Dataset):
             if not isinstance(sample, str):
                 logger.warning("Invalid sample.")
             else:
-                if sample.split(".")[-1].lower() in ("jpg", "png", "jpeg"):
-                    loaded_sample = self.get_item_image(index)
-                else:
-                    loaded_sample = self.get_item_video(index)
+                try:
+                    if sample.split(".")[-1].lower() in ("jpg", "png", "jpeg"):
+                        loaded_sample = self.get_item_image(index)
+                    else:
+                        loaded_sample = self.get_item_video(index)
+                except Exception as e:
+                    logger.warning(f"Error loading sample {sample}: {e}")
+                    loaded_sample = False
 
             if not loaded_sample:
                 index = np.random.randint(self.__len__())
