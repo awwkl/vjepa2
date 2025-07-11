@@ -34,4 +34,5 @@ configs/local
 build/
 data/videos/
 data/*.csv
+data/
 pretrain/

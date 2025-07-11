@@ -5,13 +5,13 @@ import matplotlib.pyplot as plt
 
 n_iters_per_epoch = 300
 bucket_size = 10
-log_dir = 'pretrain/16.8.vitl.256px.16f/kinetics_default_lr'
+log_dir = 'pretrain/16.8.vitl.256px.16f/babyview_final'
 loss_list_for_each_logfile = []
 for r in range(8):
     file_path = os.path.join(log_dir, f'log_r{r}.csv')
     log_df = pd.read_csv(file_path)
     log_df = log_df[~log_df['epoch'].astype(str).str.startswith('epoch')]
-    max_epoch = log_df['epoch'].max()
+    max_epoch = log_df['epoch'].astype(int).max()
     loss_list = pd.to_numeric(log_df['loss'], errors='coerce').tolist()  # Convert 'loss' column to a numeric list
     loss_list_for_each_logfile.append(loss_list)
     
@@ -30,12 +30,12 @@ for i in range(0, len(loss_list_averaged), bucket_size):
     bucket_losses.append(np.mean(bucket))
 
 plt.plot(bucket_losses, label='Mean Loss')
-plt.xticks(range(0, len(bucket_losses), n_iters_per_epoch // bucket_size), range(0, max_epoch))
+plt.xticks(range(0, len(bucket_losses), n_iters_per_epoch // bucket_size), range(0, int(max_epoch)))
 plt.ylabel('Mean Loss')
 plt.title('Loss per Bucket')
 plt.legend()
 
 plt.tight_layout()
-plt.savefig(os.path.join(log_dir, f'mean_loss_per_epoch_max_{max_epoch}.png'))
+plt.savefig(os.path.join(log_dir, f'mean_loss_per_epoch_max_{max_epoch - 1}.png'))
 plt.show()
-print(f"Plot saved to {os.path.join(log_dir, f'mean_loss_per_epoch_max_{max_epoch}.png')}")
+print(f"Plot saved to {os.path.join(log_dir, f'mean_loss_per_epoch_max_{max_epoch - 1}.png')}")
