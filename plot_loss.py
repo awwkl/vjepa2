@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 
 n_iters_per_epoch = 300
 bucket_size = 10
+log_dir = 'pretrain/16.8.vitl.256px.16f/kinetics_bs512'
+log_dir = 'anneal/32.8.vitl16-256px-16f/babyview_e50'
 log_dir = 'pretrain/16.8.vitl.256px.16f/babyview_final'
 loss_list_for_each_logfile = []
 for r in range(8):
@@ -30,7 +32,10 @@ for i in range(0, len(loss_list_averaged), bucket_size):
     bucket_losses.append(np.mean(bucket))
 
 plt.plot(bucket_losses, label='Mean Loss')
-plt.xticks(range(0, len(bucket_losses), n_iters_per_epoch // bucket_size), range(0, int(max_epoch)))
+plt.xticks(
+    range(0, len(bucket_losses), 10 * (n_iters_per_epoch // bucket_size)),
+    range(0, int(max_epoch), 10)
+)
 plt.ylabel('Mean Loss')
 plt.title('Loss per Bucket')
 plt.legend()

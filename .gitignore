@@ -36,3 +36,6 @@ data/videos/
 data/*.csv
 data/
 pretrain/
+anneal/
+evals/vitl/
+logs/
