@@ -1,0 +1,179 @@
+"""
+conda activate vjepa2-312
+
+python evals/object_reasoning/eval.py \
+    --checkpoint ./anneal/32.8.vitl16-256px-16f/babyview_bs3072_e60/e40.pt \
+    --checkpoint ./downloads/vitl.pt \
+
+"""
+
+import sys
+import os
+import argparse
+import yaml
+import copy
+from tqdm import tqdm
+
+import numpy as np
+import pandas as pd
+import torch
+import torchvision
+import torch.nn.functional as F
+
+# Add project root to Python path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from app.vjepa.utils import init_opt, init_video_model, load_checkpoint
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', type=str)
+    parser.add_argument("--fname", type=str, help="name of config file to load", default="./evals/object_reasoning/config.yaml")
+    parser.add_argument('--device', type=str, default='cuda:0', help='Device to use for evaluation')
+    parser.add_argument('--input_img_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/assets/ObjectReasoning', help='Directory of input images')
+    return parser.parse_args()
+
+def create_masks():
+    masks_enc = torch.arange(450, dtype=torch.int64).reshape(1, 1, 1, -1)
+    masks_pred = 450 + torch.arange(30, dtype=torch.int64).reshape(1, 1, 1, -1)
+
+    return masks_enc, masks_pred
+
+if __name__ == "__main__":
+    args = get_args()
+    
+    config_params = None
+    with open(args.fname, "r") as y_file:
+        config_params = yaml.load(y_file, Loader=yaml.FullLoader)
+    print(config_params)
+    print(args)
+    
+    cfgs_model = config_params.get("model")
+    cfgs_mask = config_params.get("mask")
+    cfgs_data = config_params.get("data")
+    cfgs_meta = config_params.get("meta")
+    cfgs_opt = config_params.get("optimization")
+    
+    # === Initialize model (without weights) ===
+    encoder, predictor = init_video_model(
+        uniform_power=cfgs_model.get("uniform_power", False),
+        use_mask_tokens=cfgs_model.get("use_mask_tokens", False),
+        num_mask_tokens=int(len(cfgs_mask) * len(cfgs_data.get("dataset_fpcs"))),
+        zero_init_mask_tokens=cfgs_model.get("zero_init_mask_tokens", True),
+        device=args.device,
+        patch_size=cfgs_data.get("patch_size"),
+        max_num_frames=max(cfgs_data.get("dataset_fpcs")),
+        tubelet_size= cfgs_data.get("tubelet_size"),
+        model_name=cfgs_model.get("model_name"),
+        crop_size=256,
+        pred_depth=cfgs_model.get("pred_depth"),
+        pred_num_heads=cfgs_model.get("pred_num_heads", None),
+        pred_embed_dim=cfgs_model.get("pred_embed_dim"),
+        use_sdpa=cfgs_meta.get("use_sdpa", False),
+        use_silu=cfgs_model.get("use_silu", False),
+        use_pred_silu=cfgs_model.get("use_pred_silu", False),
+        wide_silu=cfgs_model.get("wide_silu", True),
+        use_rope=cfgs_model.get("use_rope", False),
+        use_activation_checkpointing=cfgs_model.get("use_activation_checkpointing", False),
+    )
+    target_encoder = copy.deepcopy(encoder)
+
+    # === Load model weights from checkpoint ===
+    checkpoint = torch.load(args.checkpoint, map_location=torch.device("cpu"))
+    def load_state(model, key):
+        state = checkpoint[key]
+        state = {k.replace("module.", ""): v for k, v in state.items()}
+        model.load_state_dict(state)
+
+    load_state(encoder, "encoder")
+    load_state(predictor, "predictor")
+    load_state(target_encoder, "target_encoder")
+    
+    # === Load images into correct format ===
+    annotations_csv_path = os.path.join(args.input_img_dir, 'annotations.csv')
+    annotations_df = pd.read_csv(annotations_csv_path, dtype=str)
+    top_keyframe_dir = os.path.join(args.input_img_dir, 'keyframes')
+    
+    seed = 0
+    for idx, row in tqdm(annotations_df.iterrows(), total=len(annotations_df)):
+        category = row['category']
+        video_id = row['video_id']
+        
+        image_name = f'{category}_{video_id}'
+        image_seed_name = f'{image_name}_seed{seed:02d}'
+        
+        counterfactual_x = int(row['counterfactual_x'])
+        counterfactual_y = int(row['counterfactual_y'])
+        factual_x = int(row['factual_x'])
+        factual_y = int(row['factual_y'])
+        
+        frame2_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_02.png')
+        frame3_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_03.png')
+
+        frame2_tensor = torchvision.io.read_image(path=frame2_img_path, mode=torchvision.io.ImageReadMode.RGB)
+        frame2_tensor = torchvision.transforms.functional.resize(frame2_tensor, [256, 256]) # [3, H, W]
+        frame2_tensor = frame2_tensor.float() / 255.0
+        frame3_tensor = torchvision.io.read_image(path=frame3_img_path, mode=torchvision.io.ImageReadMode.RGB)
+        frame3_tensor = torchvision.transforms.functional.resize(frame3_tensor, [256, 256]) # [3, H, W]
+        frame3_tensor = frame3_tensor.float() / 255.0
+        both_frames_tensor = torch.stack([frame2_tensor, frame2_tensor, frame3_tensor, frame3_tensor], dim=0) # [T, 3, H, W]
+        
+        clips = both_frames_tensor.unsqueeze(0) # [1, T, 3, H, W]
+        clips = clips.permute(0, 2, 1, 3, 4) # [1, 3, T, H, W]
+        clips = clips.unsqueeze(0) # [1, 1, 3, T, 256, 256]
+        clips = clips.to(args.device)
+
+        masks_enc, masks_pred = create_masks()
+        masks_enc, masks_pred = masks_enc.to(args.device), masks_pred.to(args.device)
+        
+        def forward_target(c):
+            with torch.no_grad():
+                h = target_encoder(c)
+                h = [F.layer_norm(hi, (hi.size(-1),)) for hi in h]
+                return h
+
+        def forward_context(c):
+            z = encoder(c, masks_enc)
+            z = predictor(z, masks_enc, masks_pred)
+
+            return z
+        
+        target = forward_target(clips)[0] # [1, 512, 1024]
+        context = forward_context(clips)[0][0] # [1, 228, 1024]
+        
+        frame2_target = target[0, :target.shape[1] // 2, :] # [256, 1024]
+        frame3_target = target[0, target.shape[1] // 2:, :] # [256, 1024]
+        
+        pred_patch_indices = masks_pred[0][0][0].tolist() # [228]
+        pred_patch_indices = [pi - frame2_target.shape[0] for pi in pred_patch_indices]
+        pred_patch_indices = [pi for pi in pred_patch_indices if pi >= 0] # Filter out negative indices
+        
+        frame2_target_patches = frame2_target[pred_patch_indices, :] # [N, 1024]
+        frame3_target_patches = frame3_target[pred_patch_indices, :] # [N, 1024]
+
+        cosine_distance_to_frame2 = F.cosine_similarity(frame2_target_patches, context, dim=-1)  # [N]
+        avg_cosine_distance_to_frame2 = cosine_distance_to_frame2.mean()  # scalar average
+        
+        cosine_distance_to_frame3 = F.cosine_similarity(frame3_target_patches, context, dim=-1)  # [N]
+        avg_cosine_distance_to_frame3 = cosine_distance_to_frame3.mean()  # scalar average
+        
+        closer_to_frame3 = (avg_cosine_distance_to_frame2 > avg_cosine_distance_to_frame3).item()
+        print('Closer to frame 3 than 2?:', str(not closer_to_frame3))
+
+        # clips: [ [64, 3, 2, 256, 256] ]
+        # h: [ [64, 256 ????, 1024] ]
+        
+        # masks_enc[0][0]: [64, 130]
+        # masks_enc[0][1]: [64, 32]
+        # masks_pred[0][0]: [64, 228]
+        # masks_pred[0][1]: [64, 352]
+        # z[0][0]: [64, 228, 1024]
+        # z[0][1]: [64, 352, 1024]
+
+    # masks_enc[0][0][0] and masks_pred[0][0][0] -- check if they share any numbers
+    shared = set(masks_enc[0][0][0].tolist()).intersection(set(masks_pred[0][0][0].tolist()))
+    # check length of union
+    union = set(masks_enc[0][0][0].tolist()).union(set(masks_pred[0][0][0].tolist()))
