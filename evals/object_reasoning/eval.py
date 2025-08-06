@@ -2,8 +2,10 @@
 conda activate vjepa2-312
 
 python evals/object_reasoning/eval.py \
-    --checkpoint anneal/32.8.vitl16-256px-16f/babyview_bs3072_e60/e40.pt \
     --checkpoint downloads/vitl.pt \
+    --checkpoint anneal/32.8.vitl16-256px-16f/babyview_bs3072_e60/e40.pt \
+    --checkpoint downloads/vitg.pt \
+    --model_name vit_giant_xformers \
 
 """
 
@@ -14,14 +16,18 @@ import argparse
 import yaml
 import copy
 from tqdm import tqdm
+import pprint
 
 import numpy as np
 import pandas as pd
 from PIL import Image
 from PIL import ImageDraw
+import cv2
 import torch
 import torchvision
 import torch.nn.functional as F
+
+debug = False
 
 # Add project root to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -42,16 +48,20 @@ def set_seed(seed):
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str)
+    parser.add_argument('--model_name', default='vit_large', help='Model size to use', choices=['vit_large', 'vit_giant_xformers'])
     parser.add_argument("--fname", type=str, help="name of config file to load", default="./evals/object_reasoning/config.yaml")
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use for evaluation')
     parser.add_argument('--input_img_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/assets/ObjectReasoning', help='Directory of input images')
-    parser.add_argument('--out_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/model_predictions/ObjectReasoning/', help='Directory to save output images')
+    parser.add_argument('--out_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/model_predictions/ObjectReasoning/vjepa2', help='Directory to save output images')
     parser.add_argument('--seeds', nargs='+', type=int, default=[0,1,2,3,4,5,6,7], help='Seeds')
+    parser.add_argument('--segment_masks_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/assets/ObjectReasoning/segment_masks', help='Directory of segment masks')
     return parser.parse_args()
 
 
 def create_masks(unmask_indices, mask_indices):
     masks_enc = [idx + 256 for idx in unmask_indices] + list(range(256))
+    if debug:
+        masks_enc = list(range(0, 512))
     masks_enc = torch.tensor(masks_enc, dtype=torch.int64).reshape(1, 1, 1, -1)
     
     masks_pred = [idx + 256 for idx in mask_indices]
@@ -91,6 +101,17 @@ def convert_unmask_points_to_unmask_indices(unmask_points, patch_size, square_le
 
     return unmask_indices
 
+def update_pred_patch_indices(pred_patch_indices, segment_mask):
+    segment_indices = set()
+    segment_mask = cv2.resize(segment_mask.astype(np.uint8), (256, 256), interpolation=cv2.INTER_NEAREST).astype(bool)
+    for i in range(segment_mask.shape[0]):
+        for j in range(segment_mask.shape[1]):
+            if segment_mask[i, j] == 1:
+                segment_indices.add((i // 16) * 16 + (j // 16)) # based on a 16x16 patch in a 256x256 image
+
+    updated_pred_patch_indices = [i for i in pred_patch_indices if i in segment_indices]
+    return updated_pred_patch_indices
+
 def add_factual_drawing(image, unmask_points):
     resize_transform = torchvision.transforms.Resize((512, 512))
     image = resize_transform(image)
@@ -112,6 +133,10 @@ def add_factual_drawing(image, unmask_points):
 if __name__ == "__main__":
     args = get_args()
     
+    if debug:
+        args.out_dir = '/ccn2/u/khaiaw/Code/counterfactual_benchmark/model_predictions/ObjectReasoning/vjepa2_debugging'
+        args.seeds = [0]
+    
     args.out_pred_dir = os.path.join(args.out_dir, 'pred', args.checkpoint)
     os.makedirs(args.out_pred_dir, exist_ok=True)
     
@@ -122,6 +147,7 @@ if __name__ == "__main__":
     print(args)
     
     cfgs_model = config_params.get("model")
+    cfgs_model['model_name'] = args.model_name
     cfgs_mask = config_params.get("mask")
     cfgs_data = config_params.get("data")
     cfgs_meta = config_params.get("meta")
@@ -156,7 +182,7 @@ if __name__ == "__main__":
     def load_state(model, key):
         state = checkpoint[key]
         state = {k.replace("module.", ""): v for k, v in state.items()}
-        model.load_state_dict(state)
+        model.load_state_dict(state, strict=False)
 
     load_state(encoder, "encoder")
     load_state(predictor, "predictor")
@@ -168,7 +194,10 @@ if __name__ == "__main__":
     top_keyframe_dir = os.path.join(args.input_img_dir, 'keyframes')
     
     results_df = pd.DataFrame(columns=['category', 'video_id', 'seed', 
-                                       'avg_cosine_similarity_to_frame2', 'avg_cosine_similarity_to_frame3', 'closer_to_frame2'])
+                                       'avg_cosine_similarity_to_frame2', 'avg_cosine_similarity_to_frame3', 'closer_to_frame3',
+                                       'avg_cosine_similarity_to_frame2_overall_segment', 'avg_cosine_similarity_to_frame3_overall_segment', 'closer_to_frame3_overall_segment',
+                                       'avg_cosine_similarity_to_frame2_primary_segment', 'avg_cosine_similarity_to_frame3_primary_segment', 'closer_to_frame3_primary_segment'
+                                       ])
     for seed in args.seeds:
         set_seed(seed)
     
@@ -218,8 +247,10 @@ if __name__ == "__main__":
 
                 return z
             
-            target = forward_target(clips)[0] # [1, 512, 1024]
+            target = forward_target(clips)[0]  # [1, 512, 1024]
+            target = target.detach().cpu()
             context = forward_context(clips)[0][0] # [1, 228, 1024]
+            context = context.detach().cpu()[0]
             
             frame2_target = target[0, :target.shape[1] // 2, :] # [256, 1024]
             frame3_target = target[0, target.shape[1] // 2:, :] # [256, 1024]
@@ -228,38 +259,80 @@ if __name__ == "__main__":
             pred_patch_indices = [pi - frame2_target.shape[0] for pi in pred_patch_indices]
             pred_patch_indices = [pi for pi in pred_patch_indices if pi >= 0] # Filter out negative indices
             
-            frame2_target_patches = frame2_target[pred_patch_indices, :] # [N, 1024]
-            frame3_target_patches = frame3_target[pred_patch_indices, :] # [N, 1024]
+            def compute_cosine_similarities(frame2_target, frame3_target, pred_patch_indices, context):
+                frame2_target_patches = frame2_target[pred_patch_indices, :]  # [N, 1024]
+                frame3_target_patches = frame3_target[pred_patch_indices, :]  # [N, 1024]
+                
+                cosine_similarity_to_frame2 = F.cosine_similarity(frame2_target_patches, context, dim=-1)  # [N]
+                avg_cosine_similarity_to_frame2 = cosine_similarity_to_frame2.mean().item()  # scalar average
+                cosine_similarity_to_frame3 = F.cosine_similarity(frame3_target_patches, context, dim=-1)  # [N]
+                avg_cosine_similarity_to_frame3 = cosine_similarity_to_frame3.mean().item()  # scalar average
+                
+                return avg_cosine_similarity_to_frame2, avg_cosine_similarity_to_frame3
 
-            cosine_similarity_to_frame2 = F.cosine_similarity(frame2_target_patches, context, dim=-1)  # [N]
-            avg_cosine_similarity_to_frame2 = cosine_similarity_to_frame2.mean().item()  # scalar average
+            avg_cosine_similarity_to_frame2, avg_cosine_similarity_to_frame3 = compute_cosine_similarities(
+                frame2_target, frame3_target, pred_patch_indices, context)
             
-            cosine_similarity_to_frame3 = F.cosine_similarity(frame3_target_patches, context, dim=-1)  # [N]
-            avg_cosine_similarity_to_frame3 = cosine_similarity_to_frame3.mean().item()  # scalar average
             
+            def get_segment_indices_and_context(pred_patch_indices, segment_mask, context):
+                segment_pred_patch_indices = update_pred_patch_indices(pred_patch_indices, segment_mask)
+                segment_context_indices = [
+                    i for i, idx in enumerate(pred_patch_indices) if idx in segment_pred_patch_indices
+                ]
+                segment_context = context[segment_context_indices, :]
+                return segment_pred_patch_indices, segment_context
+
+            overall_segment_mask_path = os.path.join(args.segment_masks_dir, category, video_id, 'frame3_overall_mask.npy')
+            overall_segment_mask = np.load(overall_segment_mask_path)[0]
+            segment_pred_patch_indices, segment_context = get_segment_indices_and_context(pred_patch_indices, overall_segment_mask, context)
+            avg_cosine_similarity_to_frame2_overall_segment, avg_cosine_similarity_to_frame3_overall_segment = compute_cosine_similarities(
+                frame2_target, frame3_target, segment_pred_patch_indices, segment_context)
+            
+            primary_segment_mask_path = os.path.join(args.segment_masks_dir, category, video_id, 'frame3_primary_mask.npy')
+            primary_segment_mask = np.load(primary_segment_mask_path)[0]
+            segment_pred_patch_indices, segment_context = get_segment_indices_and_context(pred_patch_indices, primary_segment_mask, context)
+            avg_cosine_similarity_to_frame2_primary_segment, avg_cosine_similarity_to_frame3_primary_segment = compute_cosine_similarities(
+                frame2_target, frame3_target, segment_pred_patch_indices, segment_context)
+
             df_row = {
                 'category': category,
                 'video_id': video_id,
                 'seed': seed,
                 'avg_cosine_similarity_to_frame2': avg_cosine_similarity_to_frame2,
                 'avg_cosine_similarity_to_frame3': avg_cosine_similarity_to_frame3,
-                'closer_to_frame2': avg_cosine_similarity_to_frame2 > avg_cosine_similarity_to_frame3,
+                'closer_to_frame3': bool(avg_cosine_similarity_to_frame2 <= avg_cosine_similarity_to_frame3),
+                'avg_cosine_similarity_to_frame2_overall_segment': avg_cosine_similarity_to_frame2_overall_segment,
+                'avg_cosine_similarity_to_frame3_overall_segment': avg_cosine_similarity_to_frame3_overall_segment,
+                'closer_to_frame3_overall_segment': bool(avg_cosine_similarity_to_frame2_overall_segment <= avg_cosine_similarity_to_frame3_overall_segment),
+                'avg_cosine_similarity_to_frame2_primary_segment': avg_cosine_similarity_to_frame2_primary_segment,
+                'avg_cosine_similarity_to_frame3_primary_segment': avg_cosine_similarity_to_frame3_primary_segment,
+                'closer_to_frame3_primary_segment': bool(avg_cosine_similarity_to_frame2_primary_segment <= avg_cosine_similarity_to_frame3_primary_segment),
             }
             results_df = pd.concat([results_df, pd.DataFrame([df_row])], ignore_index=True)
-
+            
+    # for each category, print the average for closer_to_frame3, closer_to_frame3_overall_segment, closer_to_frame3_primary_segment
+    avg_results = results_df.groupby('category').agg({
+        'closer_to_frame3': 'mean',
+        'closer_to_frame3_overall_segment': 'mean',
+        'closer_to_frame3_primary_segment': 'mean'
+    }).reset_index()
+    avg_results.columns = ['category', 'avg_closer_to_frame3', 'avg_closer_to_frame3_overall_segment', 'avg_closer_to_frame3_primary_segment']
+    results_df = pd.merge(results_df, avg_results, on='category', how='left')
     results_df.to_csv(os.path.join(args.out_pred_dir, f'results.csv'), index=False)
-        
-        # clips: [ [64, 3, 2, 256, 256] ]
-        # h: [ [64, 256 ????, 1024] ]
-        
-        # masks_enc[0][0]: [64, 130]
-        # masks_enc[0][1]: [64, 32]
-        # masks_pred[0][0]: [64, 228]
-        # masks_pred[0][1]: [64, 352]
-        # z[0][0]: [64, 228, 1024]
-        # z[0][1]: [64, 352, 1024]
+    pprint.pprint(avg_results)
+
+    # ===== Extra shapes for comments purposes =====
+    # clips: [ [64, 3, 2, 256, 256] ]
+    # h: [ [64, 256 ????, 1024] ]
+    
+    # masks_enc[0][0]: [64, 130]
+    # masks_enc[0][1]: [64, 32]
+    # masks_pred[0][0]: [64, 228]
+    # masks_pred[0][1]: [64, 352]
+    # z[0][0]: [64, 228, 1024]
+    # z[0][1]: [64, 352, 1024]
 
     # masks_enc[0][0][0] and masks_pred[0][0][0] -- check if they share any numbers
-    shared = set(masks_enc[0][0][0].tolist()).intersection(set(masks_pred[0][0][0].tolist()))
+    # shared = set(masks_enc[0][0][0].tolist()).intersection(set(masks_pred[0][0][0].tolist()))
     # check length of union
-    union = set(masks_enc[0][0][0].tolist()).union(set(masks_pred[0][0][0].tolist()))
+    # union = set(masks_enc[0][0][0].tolist()).union(set(masks_pred[0][0][0].tolist()))
