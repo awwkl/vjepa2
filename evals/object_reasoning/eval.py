@@ -111,8 +111,6 @@ def add_factual_drawing(image, unmask_points):
 
 if __name__ == "__main__":
     args = get_args()
-    seed = 0
-    set_seed(seed)
     
     args.out_pred_dir = os.path.join(args.out_dir, 'pred', args.checkpoint)
     os.makedirs(args.out_pred_dir, exist_ok=True)
@@ -171,81 +169,85 @@ if __name__ == "__main__":
     
     results_df = pd.DataFrame(columns=['category', 'video_id', 'seed', 
                                        'avg_cosine_similarity_to_frame2', 'avg_cosine_similarity_to_frame3', 'closer_to_frame2'])
-    for idx, row in tqdm(annotations_df.iterrows(), total=len(annotations_df)):
-        category = row['category']
-        video_id = row['video_id']
-        
-        image_name = f'{category}_{video_id}'
-        image_seed_name = f'{image_name}_seed{seed:02d}'
-        
-        factual_x = int(row['factual_x'])
-        factual_y = int(row['factual_y'])
-        
-        unmask_points = get_unmask_points(factual_x, factual_y)
-        unmask_points = [(x // 2, y // 2) for x, y in unmask_points] # divide unmask points by 2
-        unmask_indices = convert_unmask_points_to_unmask_indices(unmask_points, 16, 2, 256)
-        mask_indices = [i for i in range(256) if i not in unmask_indices]
-        
-        frame2_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_02.png')
-        frame3_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_03.png')
+    for seed in args.seeds:
+        set_seed(seed)
+    
+        for idx, row in tqdm(annotations_df.iterrows(), total=len(annotations_df)):
+            category = row['category']
+            video_id = row['video_id']
+            
+            image_name = f'{category}_{video_id}'
+            image_seed_name = f'{image_name}_seed{seed:02d}'
+            
+            factual_x = int(row['factual_x'])
+            factual_y = int(row['factual_y'])
+            
+            unmask_points = get_unmask_points(factual_x, factual_y)
+            unmask_points = [(x // 2, y // 2) for x, y in unmask_points] # divide unmask points by 2
+            unmask_indices = convert_unmask_points_to_unmask_indices(unmask_points, 16, 2, 256)
+            mask_indices = [i for i in range(256) if i not in unmask_indices]
+            
+            frame2_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_02.png')
+            frame3_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_03.png')
 
-        frame2_tensor = torchvision.io.read_image(path=frame2_img_path, mode=torchvision.io.ImageReadMode.RGB)
-        frame2_tensor = torchvision.transforms.functional.resize(frame2_tensor, [256, 256]) # [3, H, W]
-        frame2_tensor = frame2_tensor.float() / 255.0
-        frame3_tensor = torchvision.io.read_image(path=frame3_img_path, mode=torchvision.io.ImageReadMode.RGB)
-        frame3_tensor = torchvision.transforms.functional.resize(frame3_tensor, [256, 256]) # [3, H, W]
-        frame3_tensor = frame3_tensor.float() / 255.0
-        both_frames_tensor = torch.stack([frame2_tensor, frame2_tensor, frame3_tensor, frame3_tensor], dim=0) # [T, 3, H, W]
-        
-        clips = both_frames_tensor.unsqueeze(0) # [1, T, 3, H, W]
-        clips = clips.permute(0, 2, 1, 3, 4) # [1, 3, T, H, W]
-        clips = clips.unsqueeze(0) # [1, 1, 3, T, 256, 256]
-        clips = clips.to(args.device)
+            frame2_tensor = torchvision.io.read_image(path=frame2_img_path, mode=torchvision.io.ImageReadMode.RGB)
+            frame2_tensor = torchvision.transforms.functional.resize(frame2_tensor, [256, 256]) # [3, H, W]
+            frame2_tensor = frame2_tensor.float() / 255.0
+            frame3_tensor = torchvision.io.read_image(path=frame3_img_path, mode=torchvision.io.ImageReadMode.RGB)
+            frame3_tensor = torchvision.transforms.functional.resize(frame3_tensor, [256, 256]) # [3, H, W]
+            frame3_tensor = frame3_tensor.float() / 255.0
+            both_frames_tensor = torch.stack([frame2_tensor, frame2_tensor, frame3_tensor, frame3_tensor], dim=0) # [T, 3, H, W]
+            
+            clips = both_frames_tensor.unsqueeze(0) # [1, T, 3, H, W]
+            clips = clips.permute(0, 2, 1, 3, 4) # [1, 3, T, H, W]
+            clips = clips.unsqueeze(0) # [1, 1, 3, T, 256, 256]
+            clips = clips.to(args.device)
 
-        masks_enc, masks_pred = create_masks(unmask_indices, mask_indices)
-        masks_enc, masks_pred = masks_enc.to(args.device), masks_pred.to(args.device)
-        
-        def forward_target(c):
-            with torch.no_grad():
-                h = target_encoder(c)
-                h = [F.layer_norm(hi, (hi.size(-1),)) for hi in h]
-                return h
+            masks_enc, masks_pred = create_masks(unmask_indices, mask_indices)
+            masks_enc, masks_pred = masks_enc.to(args.device), masks_pred.to(args.device)
+            
+            def forward_target(c):
+                with torch.no_grad():
+                    h = target_encoder(c)
+                    h = [F.layer_norm(hi, (hi.size(-1),)) for hi in h]
+                    return h
 
-        def forward_context(c):
-            z = encoder(c, masks_enc)
-            z = predictor(z, masks_enc, masks_pred)
+            def forward_context(c):
+                z = encoder(c, masks_enc)
+                z = predictor(z, masks_enc, masks_pred)
 
-            return z
-        
-        target = forward_target(clips)[0] # [1, 512, 1024]
-        context = forward_context(clips)[0][0] # [1, 228, 1024]
-        
-        frame2_target = target[0, :target.shape[1] // 2, :] # [256, 1024]
-        frame3_target = target[0, target.shape[1] // 2:, :] # [256, 1024]
-        
-        pred_patch_indices = masks_pred[0][0][0].tolist() # [228]
-        pred_patch_indices = [pi - frame2_target.shape[0] for pi in pred_patch_indices]
-        pred_patch_indices = [pi for pi in pred_patch_indices if pi >= 0] # Filter out negative indices
-        
-        frame2_target_patches = frame2_target[pred_patch_indices, :] # [N, 1024]
-        frame3_target_patches = frame3_target[pred_patch_indices, :] # [N, 1024]
+                return z
+            
+            target = forward_target(clips)[0] # [1, 512, 1024]
+            context = forward_context(clips)[0][0] # [1, 228, 1024]
+            
+            frame2_target = target[0, :target.shape[1] // 2, :] # [256, 1024]
+            frame3_target = target[0, target.shape[1] // 2:, :] # [256, 1024]
+            
+            pred_patch_indices = masks_pred[0][0][0].tolist() # [228]
+            pred_patch_indices = [pi - frame2_target.shape[0] for pi in pred_patch_indices]
+            pred_patch_indices = [pi for pi in pred_patch_indices if pi >= 0] # Filter out negative indices
+            
+            frame2_target_patches = frame2_target[pred_patch_indices, :] # [N, 1024]
+            frame3_target_patches = frame3_target[pred_patch_indices, :] # [N, 1024]
 
-        cosine_similarity_to_frame2 = F.cosine_similarity(frame2_target_patches, context, dim=-1)  # [N]
-        avg_cosine_similarity_to_frame2 = cosine_similarity_to_frame2.mean()  # scalar average
-        
-        cosine_similarity_to_frame3 = F.cosine_similarity(frame3_target_patches, context, dim=-1)  # [N]
-        avg_cosine_similarity_to_frame3 = cosine_similarity_to_frame3.mean()  # scalar average
-        
-        df_row = {
-            'category': category,
-            'video_id': video_id,
-            'seed': seed,
-            'avg_cosine_similarity_to_frame2': avg_cosine_similarity_to_frame2.item(),
-            'avg_cosine_similarity_to_frame3': avg_cosine_similarity_to_frame3.item(),
-            'closer_to_frame2': avg_cosine_similarity_to_frame2 > avg_cosine_similarity_to_frame3,
-        }
-        results_df = pd.concat([results_df, pd.DataFrame([df_row])], ignore_index=True)
-        results_df.to_csv(os.path.join(args.out_pred_dir, f'results.csv'), index=False)
+            cosine_similarity_to_frame2 = F.cosine_similarity(frame2_target_patches, context, dim=-1)  # [N]
+            avg_cosine_similarity_to_frame2 = cosine_similarity_to_frame2.mean().item()  # scalar average
+            
+            cosine_similarity_to_frame3 = F.cosine_similarity(frame3_target_patches, context, dim=-1)  # [N]
+            avg_cosine_similarity_to_frame3 = cosine_similarity_to_frame3.mean().item()  # scalar average
+            
+            df_row = {
+                'category': category,
+                'video_id': video_id,
+                'seed': seed,
+                'avg_cosine_similarity_to_frame2': avg_cosine_similarity_to_frame2,
+                'avg_cosine_similarity_to_frame3': avg_cosine_similarity_to_frame3,
+                'closer_to_frame2': avg_cosine_similarity_to_frame2 > avg_cosine_similarity_to_frame3,
+            }
+            results_df = pd.concat([results_df, pd.DataFrame([df_row])], ignore_index=True)
+
+    results_df.to_csv(os.path.join(args.out_pred_dir, f'results.csv'), index=False)
         
         # clips: [ [64, 3, 2, 256, 256] ]
         # h: [ [64, 256 ????, 1024] ]
