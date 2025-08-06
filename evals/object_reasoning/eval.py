@@ -2,13 +2,14 @@
 conda activate vjepa2-312
 
 python evals/object_reasoning/eval.py \
-    --checkpoint ./anneal/32.8.vitl16-256px-16f/babyview_bs3072_e60/e40.pt \
-    --checkpoint ./downloads/vitl.pt \
+    --checkpoint anneal/32.8.vitl16-256px-16f/babyview_bs3072_e60/e40.pt \
+    --checkpoint downloads/vitl.pt \
 
 """
 
 import sys
 import os
+import random
 import argparse
 import yaml
 import copy
@@ -16,6 +17,8 @@ from tqdm import tqdm
 
 import numpy as np
 import pandas as pd
+from PIL import Image
+from PIL import ImageDraw
 import torch
 import torchvision
 import torch.nn.functional as F
@@ -27,6 +30,14 @@ if project_root not in sys.path:
 
 from app.vjepa.utils import init_opt, init_video_model, load_checkpoint
 
+fixed_point_sampler_rng = None # use a private generator to sample fixed points, unaffected by model calls
+def set_seed(seed):
+    global fixed_point_sampler_rng
+    fixed_point_sampler_rng = random.Random(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -34,16 +45,77 @@ def get_args():
     parser.add_argument("--fname", type=str, help="name of config file to load", default="./evals/object_reasoning/config.yaml")
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use for evaluation')
     parser.add_argument('--input_img_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/assets/ObjectReasoning', help='Directory of input images')
+    parser.add_argument('--out_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/model_predictions/ObjectReasoning/', help='Directory to save output images')
+    parser.add_argument('--seeds', nargs='+', type=int, default=[0,1,2,3,4,5,6,7], help='Seeds')
     return parser.parse_args()
 
-def create_masks():
-    masks_enc = torch.arange(450, dtype=torch.int64).reshape(1, 1, 1, -1)
-    masks_pred = 450 + torch.arange(30, dtype=torch.int64).reshape(1, 1, 1, -1)
 
+def create_masks(unmask_indices, mask_indices):
+    masks_enc = [idx + 256 for idx in unmask_indices] + list(range(256))
+    masks_enc = torch.tensor(masks_enc, dtype=torch.int64).reshape(1, 1, 1, -1)
+    
+    masks_pred = [idx + 256 for idx in mask_indices]
+    masks_pred = torch.tensor(masks_pred, dtype=torch.int64).reshape(1, 1, 1, -1)
+    
     return masks_enc, masks_pred
+
+def get_unmask_points(factual_x, factual_y):
+    unmask_points = [(factual_x, factual_y)]
+    
+    fixed_top_points = []
+    fixed_bottom_points = []
+    # for every 16 range from 0 to 480,
+    for i in range(32, 481, 64):
+        fixed_top_points.append((i, 32))
+        fixed_bottom_points.append((i, 480))
+    # randomly sample N fixed_points
+    num_fixed_points = fixed_point_sampler_rng.randint(3, 5)
+    fixed_top_points_sampled = fixed_point_sampler_rng.sample(fixed_top_points, num_fixed_points)
+    num_fixed_points = fixed_point_sampler_rng.randint(3, 5)
+    fixed_bottom_points_sampled = fixed_point_sampler_rng.sample(fixed_bottom_points, num_fixed_points)
+    unmask_points.extend(fixed_top_points_sampled)
+    unmask_points.extend(fixed_bottom_points_sampled)
+    
+    return unmask_points
+
+def convert_unmask_points_to_unmask_indices(unmask_points, patch_size, square_length_in_patches, resolution):
+    num_patches_per_side = resolution // patch_size
+
+    unmask_indices = []
+    for unmask_x, unmask_y in unmask_points:
+        top_left_x, top_left_y = unmask_x - patch_size * square_length_in_patches // 2, unmask_y - patch_size * square_length_in_patches // 2
+        top_left_idx = (top_left_y // patch_size) * num_patches_per_side + (top_left_x // patch_size)
+        patch_size_move_list = [(i, j) for i in range(square_length_in_patches) for j in range(square_length_in_patches)]
+        for i, j in patch_size_move_list:
+            unmask_indices.append(top_left_idx + j * num_patches_per_side + i)
+
+    return unmask_indices
+
+def add_factual_drawing(image, unmask_points):
+    resize_transform = torchvision.transforms.Resize((512, 512))
+    image = resize_transform(image)
+    
+    draw = ImageDraw.Draw(image)
+    for i, (x, y) in enumerate(unmask_points):
+        if i == 0:
+            color = (0, 255, 0)
+        else:
+            color = (255, 0, 0)
+        x = round(x / 16) * 16  # round to nearest multiple of 16
+        y = round(y / 16) * 16
+
+        draw.rectangle([x - 32, y - 32, x + 32, y + 32], outline=color, fill=None)
+        draw.rectangle([x - 2, y - 2, x + 2, y + 2], fill=color) # draw a dot at x, y
+
+    return image
 
 if __name__ == "__main__":
     args = get_args()
+    seed = 0
+    set_seed(seed)
+    
+    args.out_pred_dir = os.path.join(args.out_dir, 'pred', args.checkpoint)
+    os.makedirs(args.out_pred_dir, exist_ok=True)
     
     config_params = None
     with open(args.fname, "r") as y_file:
@@ -97,7 +169,8 @@ if __name__ == "__main__":
     annotations_df = pd.read_csv(annotations_csv_path, dtype=str)
     top_keyframe_dir = os.path.join(args.input_img_dir, 'keyframes')
     
-    seed = 0
+    results_df = pd.DataFrame(columns=['category', 'video_id', 'seed', 
+                                       'avg_cosine_similarity_to_frame2', 'avg_cosine_similarity_to_frame3', 'closer_to_frame2'])
     for idx, row in tqdm(annotations_df.iterrows(), total=len(annotations_df)):
         category = row['category']
         video_id = row['video_id']
@@ -105,10 +178,13 @@ if __name__ == "__main__":
         image_name = f'{category}_{video_id}'
         image_seed_name = f'{image_name}_seed{seed:02d}'
         
-        counterfactual_x = int(row['counterfactual_x'])
-        counterfactual_y = int(row['counterfactual_y'])
         factual_x = int(row['factual_x'])
         factual_y = int(row['factual_y'])
+        
+        unmask_points = get_unmask_points(factual_x, factual_y)
+        unmask_points = [(x // 2, y // 2) for x, y in unmask_points] # divide unmask points by 2
+        unmask_indices = convert_unmask_points_to_unmask_indices(unmask_points, 16, 2, 256)
+        mask_indices = [i for i in range(256) if i not in unmask_indices]
         
         frame2_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_02.png')
         frame3_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_03.png')
@@ -126,7 +202,7 @@ if __name__ == "__main__":
         clips = clips.unsqueeze(0) # [1, 1, 3, T, 256, 256]
         clips = clips.to(args.device)
 
-        masks_enc, masks_pred = create_masks()
+        masks_enc, masks_pred = create_masks(unmask_indices, mask_indices)
         masks_enc, masks_pred = masks_enc.to(args.device), masks_pred.to(args.device)
         
         def forward_target(c):
@@ -154,15 +230,23 @@ if __name__ == "__main__":
         frame2_target_patches = frame2_target[pred_patch_indices, :] # [N, 1024]
         frame3_target_patches = frame3_target[pred_patch_indices, :] # [N, 1024]
 
-        cosine_distance_to_frame2 = F.cosine_similarity(frame2_target_patches, context, dim=-1)  # [N]
-        avg_cosine_distance_to_frame2 = cosine_distance_to_frame2.mean()  # scalar average
+        cosine_similarity_to_frame2 = F.cosine_similarity(frame2_target_patches, context, dim=-1)  # [N]
+        avg_cosine_similarity_to_frame2 = cosine_similarity_to_frame2.mean()  # scalar average
         
-        cosine_distance_to_frame3 = F.cosine_similarity(frame3_target_patches, context, dim=-1)  # [N]
-        avg_cosine_distance_to_frame3 = cosine_distance_to_frame3.mean()  # scalar average
+        cosine_similarity_to_frame3 = F.cosine_similarity(frame3_target_patches, context, dim=-1)  # [N]
+        avg_cosine_similarity_to_frame3 = cosine_similarity_to_frame3.mean()  # scalar average
         
-        closer_to_frame3 = (avg_cosine_distance_to_frame2 > avg_cosine_distance_to_frame3).item()
-        print('Closer to frame 3 than 2?:', str(not closer_to_frame3))
-
+        df_row = {
+            'category': category,
+            'video_id': video_id,
+            'seed': seed,
+            'avg_cosine_similarity_to_frame2': avg_cosine_similarity_to_frame2.item(),
+            'avg_cosine_similarity_to_frame3': avg_cosine_similarity_to_frame3.item(),
+            'closer_to_frame2': avg_cosine_similarity_to_frame2 > avg_cosine_similarity_to_frame3,
+        }
+        results_df = pd.concat([results_df, pd.DataFrame([df_row])], ignore_index=True)
+        results_df.to_csv(os.path.join(args.out_pred_dir, f'results.csv'), index=False)
+        
         # clips: [ [64, 3, 2, 256, 256] ]
         # h: [ [64, 256 ????, 1024] ]
         
