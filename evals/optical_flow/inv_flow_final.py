@@ -17,7 +17,6 @@ python evals/optical_flow/inv_flow_final.py \
     --zoom_iters $ZOOM_ITERS \
     --mask_ratio 0.9 \
     --no_blur \
-    --frame_gap -1 \
     --model_type vjepa2 \
     --flat_points_start_idx 0 \
     --num_flat_points_to_process 100 \
@@ -887,23 +886,6 @@ def main(args):
         start_uid, end_uid, *_ = data_uid.split(",")
         st = int(start_uid.split("_")[-1])
         et = int(end_uid.split("_")[-1])
-
-        frame_gap_policy = None
-        if args.frame_gap is None: 
-            frame_gap = None 
-        else: 
-            if args.frame_gap < 0:
-                frame_gap_policy = "dynamic_with_cap"
-                frame_gap = min(max(et - st, 5), 15)
-            else:
-                frame_gap_policy = "fixed"
-                frame_gap = args.frame_gap
-        
-        if counts == 0: 
-            print(f"Data Frame Gap: {et - st} => {frame_gap} due to frame gap policy {frame_gap_policy}.")
-            
-            if args.clump_mask_size > 0: 
-                logging.info(f"Clumping masks. Each mask will be {args.clump_mask_size}x{args.clump_mask_size} patches.")
 
         kl_epe_logs[data_uid] = {} 
         rgb_epe_logs[data_uid] = {} 

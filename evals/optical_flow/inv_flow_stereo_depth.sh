@@ -3,11 +3,9 @@ set -xeou pipefail
 # conda activate vjepa2-312
 ############
 
-idx=3
-DEVICE=7
-# num=4861
-num=9722
-# ckpt=downloads/vitl.pt
+idx=0
+DEVICE=2
+ckpt=downloads/vitl.pt
 # ckpt=anneal/32.8.vitl16-256px-16f/babyview_bs3072_e60/e40.pt
 # model_size=vit_large
 
@@ -19,14 +17,11 @@ ZOOM_ITERS=4
 STD=2
 NUM_ROLLOUTS=1
 fg=-1
+num=9999
 start=$((idx * num))
 
-# SAVE_DIR=/ccn2/u/khaiaw/Code/ccwm/viz/flow_counterfactuals/full_tapvid_davis_first/std_${STD}_zoom_${ZOOM_ITERS}
-# datapath=/ccn2/u/ksimon12/flow/miniflow/full_tapvid_davis_first/dataset.json
-
-SAVE_DIR=/ccn2/u/khaiaw/Code/ccwm/viz/flow_counterfactuals/full_tapvid_kubric_first/std_${STD}_zoom_${ZOOM_ITERS}
-datapath=/ccn2/u/ksimon12/flow/miniflow/full_tapvid_kubric_first/dataset.json
-
+SAVE_DIR=/ccn2/u/khaiaw/Code/ccwm/viz/flow_counterfactuals/flow_stereo_depth/std_${STD}_zoom_${ZOOM_ITERS}
+datapath=/ccn2/u/khaiaw/Code/UniQA-3D/stereo_benchmark/metadata/flow_points.json
 cd /ccn2/u/khaiaw/Code/baselines/vjepa2
 
 python evals/optical_flow/inv_flow_final.py \
@@ -42,7 +37,7 @@ python evals/optical_flow/inv_flow_final.py \
     --model_size $model_size \
     --model_name $ckpt \
     --log_interval=10 \
-    --viz_interval=1000 \
+    --viz_interval=50 \
     --squish \
     --device cuda:$DEVICE \
     --compile
