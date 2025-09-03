@@ -141,6 +141,9 @@ def main(args, resume_preempt=False):
     ema = cfgs_opt.get("ema")
     betas = cfgs_opt.get("betas", (0.9, 0.999))
     eps = cfgs_opt.get("eps", 1.0e-8)
+    # -- GRADIENT ACCUMULATION
+    grad_accum_steps = cfgs_opt.get("grad_accum_steps", 1)
+    logger.info(f"Gradient accumulation steps: {grad_accum_steps}")
     # ----------------------------------------------------------------------- #
     # ----------------------------------------------------------------------- #
 
@@ -366,40 +369,50 @@ def main(args, resume_preempt=False):
         for itr in range(ipe):
             itr_start_time = time.time()
 
-            iter_retries = 0
-            iter_successful = False
-            while not iter_successful:
-                try:
-                    sample = next(loader)
-                    iter_successful = True
-                except StopIteration:
-                    logger.info("Exhausted data loaders. Refreshing...")
-                    unsupervised_sampler.set_epoch(epoch)
-                    loader = iter(unsupervised_loader)
-                except Exception as e:
-                    NUM_RETRIES = 5
-                    if iter_retries < NUM_RETRIES:
-                        logger.warning(f"Encountered exception when loading data (num retries {iter_retries}):\n{e}")
-                        iter_retries += 1
-                        time.sleep(5)
-                    else:
-                        logger.warning(f"Exceeded max retries ({NUM_RETRIES}) when loading data. Skipping batch.")
-                        raise e
+            # Accumulate gradients over multiple steps
+            all_clips_accum = []
+            all_masks_enc_accum = []
+            all_masks_pred_accum = []
+            
+            for accum_step in range(grad_accum_steps):
+                iter_retries = 0
+                iter_successful = False
+                while not iter_successful:
+                    try:
+                        sample = next(loader)
+                        iter_successful = True
+                    except StopIteration:
+                        logger.info("Exhausted data loaders. Refreshing...")
+                        unsupervised_sampler.set_epoch(epoch)
+                        loader = iter(unsupervised_loader)
+                    except Exception as e:
+                        NUM_RETRIES = 100
+                        if iter_retries < NUM_RETRIES:
+                            logger.warning(f"Encountered exception when loading data (num retries {iter_retries}):\n{e}")
+                            iter_retries += 1
+                            time.sleep(1)
+                        else:
+                            logger.warning(f"Exceeded max retries ({NUM_RETRIES}) when loading data. Skipping batch.")
+                            raise e
 
-            for _fpc_sample in sample:
-                bs, fpc = _fpc_sample[0][-1][0].size()
-                mask_meters[fpc].update(bs / batch_size)
+                for _fpc_sample in sample:
+                    bs, fpc = _fpc_sample[0][-1][0].size()
+                    mask_meters[fpc].update(bs / (batch_size * grad_accum_steps))
 
-            def load_clips():
-                all_clips, all_masks_enc, all_masks_pred = [], [], []
-                for fpc_sample in sample:
-                    udata, masks_enc, masks_pred = fpc_sample
-                    all_clips += [udata[0][0].to(device, non_blocking=True)]
-                    all_masks_enc += [[m.to(device, non_blocking=True) for m in masks_enc]]
-                    all_masks_pred += [[m.to(device, non_blocking=True) for m in masks_pred]]
-                return all_clips, all_masks_enc, all_masks_pred
+                def load_clips():
+                    all_clips, all_masks_enc, all_masks_pred = [], [], []
+                    for fpc_sample in sample:
+                        udata, masks_enc, masks_pred = fpc_sample
+                        all_clips += [udata[0][0].to(device, non_blocking=True)]
+                        all_masks_enc += [[m.to(device, non_blocking=True) for m in masks_enc]]
+                        all_masks_pred += [[m.to(device, non_blocking=True) for m in masks_pred]]
+                    return all_clips, all_masks_enc, all_masks_pred
 
-            clips, masks_enc, masks_pred = load_clips()
+                clips, masks_enc, masks_pred = load_clips()
+                all_clips_accum.append(clips)
+                all_masks_enc_accum.append(masks_enc)
+                all_masks_pred_accum.append(masks_pred)
+
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
@@ -434,19 +447,30 @@ def main(args, resume_preempt=False):
                     loss /= n
                     return loss
 
-                # Step 1. Forward
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)
-                    z = forward_context(clips)
-                    loss = loss_fn(z, h)  # jepa prediction loss
+                # Step 1. Forward pass with gradient accumulation
+                accumulated_loss = 0.0
+                for accum_step in range(grad_accum_steps):
+                    clips = all_clips_accum[accum_step]
+                    masks_enc = all_masks_enc_accum[accum_step]
+                    masks_pred = all_masks_pred_accum[accum_step]
+                    
+                    with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                        
+                        h = forward_target(clips)
+                        z = forward_context(clips)
+                        
+                        loss = loss_fn(z, h) / grad_accum_steps  # Scale loss by accumulation steps
+                        accumulated_loss += loss.item()
+                    
+                    # Backward pass
+                    if mixed_precision:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
-                # Step 2. Backward & step
+                # Step 2. Optimizer step after accumulation
                 if mixed_precision:
-                    scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                else:
-                    loss.backward()
-                if mixed_precision:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -465,7 +489,7 @@ def main(args, resume_preempt=False):
                     torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
                 return (
-                    float(loss),
+                    accumulated_loss,
                     _new_lr,
                     _new_wd,
                 )
