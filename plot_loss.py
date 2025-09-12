@@ -6,12 +6,12 @@ import matplotlib.pyplot as plt
 n_iters_per_epoch = 300
 bucket_size = 10
 log_dir = 'pretrain/16.8.vitl.256px.16f/kinetics_bs512'
-log_dir = 'anneal/32.8.vitl16-256px-16f/babyview_e50'
-log_dir = 'pretrain/16.8.vitl.256px.16f/babyview_bs512'
-log_dir = 'pretrain/16.8.vitl.256px.16f/babyview_bs3072'
+# log_dir = 'anneal/32.8.vitl16-256px-16f/babyview_e50'
+# log_dir = 'pretrain/16.8.vitl.256px.16f/babyview_bs512'
+# log_dir = 'pretrain/16.8.vitl.256px.16f/babyview_bs3072'
 
 # log_dir = 'anneal/32.8.vitl16-256px-16f/babyview_bs3072_e60'
-log_dir = 'pretrain/16.8.vitl.256px.16f/babyview_bs3072_default'
+# log_dir = 'pretrain/16.8.vitl.256px.16f/babyview_bs3072_default'
 loss_list_for_each_logfile = []
 for r in range(8):
     file_path = os.path.join(log_dir, f'log_r{r}.csv')
@@ -41,7 +41,7 @@ plt.xticks(
     range(0, int(max_epoch), 10)
 )
 plt.ylabel('Mean Loss')
-plt.title('Loss per Bucket')
+plt.title(f'Loss per Bucket -- {log_dir.split("/")[-1]}')
 plt.legend()
 
 plt.tight_layout()
