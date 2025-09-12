@@ -3,14 +3,14 @@ nodes: 1
 tasks_per_node: 8
 cpus_per_task: 16
 mem_per_gpu: 144G
-folder: ./pretrain/16.8.vitl.256px.16f
+folder: ./pretrain/16.8.vitl.256px.16f/vitl_babyview_2025.2_bs3072
 data:
   dataset_type: VideoDataset
   datasets:
-  - ./data/babyview_paths.csv
+  - data/babyview_2025.2_paths.csv
   datasets_weights:
   - 1
-  batch_size: 24
+  batch_size: 64
   crop_size: 256
   patch_size: 16
   dataset_fpcs:
