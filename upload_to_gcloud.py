@@ -2,10 +2,11 @@ import os
 import subprocess
 
 # overall_dir = 'pretrain'
-overall_dir = 'evals/vitl'
+# overall_dir = 'evals/vitl'
+overall_dir = 'pretrain/16.8.vitl.256px.16f/vitl_babyview_2025.2_bs3072'
 
 upload_path = f"gs://ccwm/ccwm/models/vjepa2/babyview/{overall_dir}"
-command = ["gsutil", "cp", "-r", overall_dir, upload_path]
+command = ["gsutil", "rsync", "-r", overall_dir, upload_path]
 subprocess.run(command)
 
 # for model_dir in model_dir_list:
