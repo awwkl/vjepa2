@@ -6,7 +6,7 @@ import subprocess
 overall_dir = 'pretrain/16.8.vitl.256px.16f/vitl_babyview_2025.2_bs3072'
 
 upload_path = f"gs://ccwm/ccwm/models/vjepa2/babyview/{overall_dir}"
-command = ["gsutil", "rsync", "-r", overall_dir, upload_path]
+command = ["gsutil", "rsync", "-P", "-r", overall_dir, upload_path] # -P tries to preserve POSIX attrs (mtime, atime, mode)
 subprocess.run(command)
 
 # for model_dir in model_dir_list:
