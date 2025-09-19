@@ -3,9 +3,15 @@ conda activate vjepa2-312
 
 python evals/object_reasoning/eval.py \
     --checkpoint downloads/vitl.pt \
-    --checkpoint anneal/32.8.vitl16-256px-16f/babyview_bs3072_e60/e40.pt \
+    --checkpoint anneal/32.8.vitl16-256px-16f/babyview_bs3072_e140/e40.pt \
     --checkpoint downloads/vitg.pt \
     --model_name vit_giant_xformers \
+    --checkpoint downloads/vith.pt \
+    --model_name vit_huge \
+
+Referenced code from:
+- evals/video_classification_frozen/eval.py (for the model initialization and loading functions)
+- notebooks/vjepa2_demo.py (for the video processing transforms)
 
 """
 
@@ -27,7 +33,8 @@ import torch
 import torchvision
 import torch.nn.functional as F
 
-debug = False
+IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 # Add project root to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -35,6 +42,9 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from app.vjepa.utils import init_opt, init_video_model, load_checkpoint
+import src.datasets.utils.video.transforms as video_transforms
+import src.datasets.utils.video.volume_transforms as volume_transforms
+
 
 fixed_point_sampler_rng = None # use a private generator to sample fixed points, unaffected by model calls
 def set_seed(seed):
@@ -48,20 +58,19 @@ def set_seed(seed):
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str)
-    parser.add_argument('--model_name', default='vit_large', help='Model size to use', choices=['vit_large', 'vit_giant_xformers'])
+    parser.add_argument('--model_name', default='vit_large', help='Model size to use', choices=['vit_large', 'vit_huge', 'vit_giant_xformers'])
     parser.add_argument("--fname", type=str, help="name of config file to load", default="./evals/object_reasoning/config.yaml")
     parser.add_argument('--device', type=str, default='cuda:0', help='Device to use for evaluation')
     parser.add_argument('--input_img_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/assets/ObjectReasoning', help='Directory of input images')
     parser.add_argument('--out_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/model_predictions/ObjectReasoning/vjepa2', help='Directory to save output images')
     parser.add_argument('--seeds', nargs='+', type=int, default=[0,1,2,3,4,5,6,7], help='Seeds')
     parser.add_argument('--segment_masks_dir', type=str, default='/ccn2/u/khaiaw/Code/counterfactual_benchmark/assets/ObjectReasoning/segment_masks', help='Directory of segment masks')
+    parser.add_argument('--debug', action='store_true', help='Debug mode with limited data')
     return parser.parse_args()
 
 
 def create_masks(unmask_indices, mask_indices):
     masks_enc = [idx + 256 for idx in unmask_indices] + list(range(256))
-    if debug:
-        masks_enc = list(range(0, 512))
     masks_enc = torch.tensor(masks_enc, dtype=torch.int64).reshape(1, 1, 1, -1)
     
     masks_pred = [idx + 256 for idx in mask_indices]
@@ -130,10 +139,21 @@ def add_factual_drawing(image, unmask_points):
 
     return image
 
+def build_pt_video_transform():
+    eval_transform = video_transforms.Compose(
+        [
+            video_transforms.Resize(256, interpolation="bilinear"),
+            video_transforms.CenterCrop(size=(256, 256)),
+            volume_transforms.ClipToTensor(),
+            video_transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+        ]
+    )
+    return eval_transform
+
 if __name__ == "__main__":
     args = get_args()
     
-    if debug:
+    if args.debug:
         args.out_dir = '/ccn2/u/khaiaw/Code/counterfactual_benchmark/model_predictions/ObjectReasoning/vjepa2_debugging'
         args.seeds = [0]
     
@@ -218,17 +238,33 @@ if __name__ == "__main__":
             
             frame2_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_02.png')
             frame3_img_path = os.path.join(top_keyframe_dir, category, video_id, 'frame_03.png')
-
-            frame2_tensor = torchvision.io.read_image(path=frame2_img_path, mode=torchvision.io.ImageReadMode.RGB)
-            frame2_tensor = torchvision.transforms.functional.resize(frame2_tensor, [256, 256]) # [3, H, W]
-            frame2_tensor = frame2_tensor.float() / 255.0
-            frame3_tensor = torchvision.io.read_image(path=frame3_img_path, mode=torchvision.io.ImageReadMode.RGB)
-            frame3_tensor = torchvision.transforms.functional.resize(frame3_tensor, [256, 256]) # [3, H, W]
-            frame3_tensor = frame3_tensor.float() / 255.0
-            both_frames_tensor = torch.stack([frame2_tensor, frame2_tensor, frame3_tensor, frame3_tensor], dim=0) # [T, 3, H, W]
             
-            clips = both_frames_tensor.unsqueeze(0) # [1, T, 3, H, W]
-            clips = clips.permute(0, 2, 1, 3, 4) # [1, 3, T, H, W]
+            def get_video(frame2_img_path, frame3_img_path):
+                """
+                Load two RGB frames from disk and return a 'video' tensor shaped like Decord's
+                vr.get_batch(...).asnumpy(): (T, H, W, C), dtype=uint8.
+                """
+                def load_rgb(path):
+                    img = Image.open(path).convert("RGB")   # ensure 3 channels, RGB order
+                    return np.asarray(img, dtype=np.uint8)  # (H, W, C) uint8
+
+                f2 = load_rgb(frame2_img_path)
+                f3 = load_rgb(frame3_img_path)
+
+                # If sizes differ, resize second to match first (or raise—your call)
+                if f2.shape[:2] != f3.shape[:2]:
+                    Image.MAX_IMAGE_PIXELS = None
+                    f3 = np.asarray(Image.fromarray(f3).resize((f2.shape[1], f2.shape[0]), Image.BILINEAR), dtype=np.uint8)
+
+                video = np.stack([f2, f2, f3, f3], axis=0)  # repeat it 2 times because tubelet size of 2 (T=4, H, W, C)
+                return video
+
+            video = get_video(frame2_img_path, frame3_img_path) # (4, 512, 512, 3)
+            video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
+            
+            pt_transform = build_pt_video_transform()
+            clips = pt_transform(video).cuda().unsqueeze(0)
+            
             clips = clips.unsqueeze(0) # [1, 1, 3, T, 256, 256]
             clips = clips.to(args.device)
 
@@ -316,6 +352,7 @@ if __name__ == "__main__":
         'closer_to_frame3_overall_segment': 'mean',
         'closer_to_frame3_primary_segment': 'mean'
     }).reset_index()
+    avg_results[['closer_to_frame3', 'closer_to_frame3_overall_segment', 'closer_to_frame3_primary_segment']] *= 100
     avg_results.columns = ['category', 'avg_closer_to_frame3', 'avg_closer_to_frame3_overall_segment', 'avg_closer_to_frame3_primary_segment']
     results_df = pd.merge(results_df, avg_results, on='category', how='left')
     results_df.to_csv(os.path.join(args.out_pred_dir, f'results.csv'), index=False)
