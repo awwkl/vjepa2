@@ -33,8 +33,6 @@ import torch
 import torchvision
 import torch.nn.functional as F
 
-IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
 # Add project root to Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -140,6 +138,8 @@ def add_factual_drawing(image, unmask_points):
     return image
 
 def build_pt_video_transform():
+    IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
     eval_transform = video_transforms.Compose(
         [
             video_transforms.Resize(256, interpolation="bilinear"),
