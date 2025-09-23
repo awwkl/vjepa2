@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import gc
+import time
 import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
@@ -75,6 +77,7 @@ def main(args_eval, resume_preempt=False):
     args_classifier = args_exp.get("classifier")
     num_probe_blocks = args_classifier.get("num_probe_blocks", 1)
     num_heads = args_classifier.get("num_heads", 16)
+    print('num_probe_blocks:', num_probe_blocks)
 
     # -- DATA
     args_data = args_exp.get("data")
@@ -92,6 +95,8 @@ def main(args_eval, resume_preempt=False):
 
     # -- OPTIMIZATION
     args_opt = args_exp.get("optimization")
+    train_ipe = args_opt.get("train_ipe", 1000)
+    val_ipe = args_opt.get("val_ipe", 100)
     batch_size = args_opt.get("batch_size")
     num_epochs = args_opt.get("num_epochs")
     use_bfloat16 = args_opt.get("use_bfloat16")
@@ -133,7 +138,7 @@ def main(args_eval, resume_preempt=False):
 
     # -- make csv_logger
     if rank == 0:
-        csv_logger = CSVLogger(log_file, ("%d", "epoch"), ("%.5f", "loss"), ("%.5f", "acc"))
+        csv_logger = CSVLogger(log_file, ("%d", "epoch"), ("%.5f", "train_acc"), ("%.5f", "val_acc"))
 
     # Initialize model
 
@@ -178,7 +183,7 @@ def main(args_eval, resume_preempt=False):
         num_workers=num_workers,
         normalization=normalization,
     )
-    val_loader, _ = make_dataloader(
+    val_loader, val_sampler = make_dataloader(
         dataset_type=dataset_type,
         root_path=val_data_path,
         img_size=resolution,
@@ -255,8 +260,14 @@ def main(args_eval, resume_preempt=False):
                 wd_scheduler=wd_scheduler,
                 data_loader=train_loader,
                 use_bfloat16=use_bfloat16,
+                ipe=train_ipe,
             )
 
+        gc.collect()
+        logger.info(f"=== EPOCH {epoch + 1} TRAIN DONE ===")
+        time.sleep(3)  # -- give time for gc to collect
+
+        val_sampler.set_epoch(epoch) # I have verified that this makes it sample a different subset of data
         val_acc = run_one_epoch(
             device=device,
             training=False,
@@ -268,11 +279,11 @@ def main(args_eval, resume_preempt=False):
             wd_scheduler=wd_scheduler,
             data_loader=val_loader,
             use_bfloat16=use_bfloat16,
+            ipe=val_ipe,
         )
 
-        logger.info("[%5d] train: %.3f%% test: %.3f%%" % (epoch + 1, train_acc, val_acc))
-        if rank == 0:
-            csv_logger.log(epoch + 1, train_acc, val_acc)
+        logger.info("[%5d] train: %.3f%% val: %.3f%%" % (epoch + 1, train_acc, val_acc))
+        csv_logger.log(epoch + 1, train_acc, val_acc)
 
         if val_only:
             return
@@ -291,6 +302,7 @@ def run_one_epoch(
     wd_scheduler,
     data_loader,
     use_bfloat16,
+    ipe,
 ):
 
     for c in classifiers:
@@ -298,7 +310,18 @@ def run_one_epoch(
 
     criterion = torch.nn.CrossEntropyLoss()
     top1_meters = [AverageMeter() for _ in classifiers]
-    for itr, data in enumerate(data_loader):
+    
+    # for itr, data in enumerate(data_loader):
+    loader = iter(data_loader)
+    for itr in range(ipe):
+        data = None
+        while data is None:
+            try:
+                data = next(loader)
+            except Exception as e:
+                logger.warning(f"Error loading data: {e}")
+                data = None
+
         if training:
             [s.step() for s in scheduler]
             [wds.step() for wds in wd_scheduler]
