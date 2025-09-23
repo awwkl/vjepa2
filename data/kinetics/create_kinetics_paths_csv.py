@@ -5,10 +5,11 @@ from tqdm import tqdm
 
 val_or_train = 'train'  # Change to 'train' if needed
 
-if val_or_train == 'train':
-    videos_dir = f'./data/videos/kinetics_videos'
-else:
-    videos_dir = f'./data/videos/eval/kinetics400_{val_or_train}_videos'
+videos_dir = f'./data/videos/kinetics400_{val_or_train}'
+# if val_or_train == 'train':
+#     videos_dir = f'./data/videos/kinetics_videos'
+# else:
+#     videos_dir = f'./data/videos/eval/kinetics400_{val_or_train}_videos'
 
 annotations_file = f'./data/kinetics/annotations/{val_or_train}.csv'
 class_name_to_number_file = './data/kinetics/annotations/kinetics_400_labels.csv'
