@@ -283,7 +283,8 @@ def main(args_eval, resume_preempt=False):
         )
 
         logger.info("[%5d] train: %.3f%% val: %.3f%%" % (epoch + 1, train_acc, val_acc))
-        csv_logger.log(epoch + 1, train_acc, val_acc)
+        if rank == 0:
+            csv_logger.log(epoch + 1, train_acc, val_acc)
 
         if val_only:
             return
