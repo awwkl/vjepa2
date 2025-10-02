@@ -201,7 +201,13 @@ def main(args_eval, resume_preempt=False):
         normalization=normalization,
     )
     ipe = len(train_loader)
-    logger.info(f"Dataloader created... iterations per epoch: {ipe}")
+    len_train_loader = len(train_loader)
+    train_ipe = min(train_ipe, len_train_loader)
+    logger.info(f"Training Dataloader created... iterations per epoch: {train_ipe}")
+    
+    len_val_loader = len(val_loader)
+    val_ipe = min(val_ipe, len_val_loader)
+    logger.info(f"Validation Dataloader created... iterations per epoch: {val_ipe}")
 
     # -- optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
